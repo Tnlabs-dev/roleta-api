@@ -1,6 +1,6 @@
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pytest
@@ -327,6 +327,43 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
     }
 
 
+def test_personaliza_nome_da_api_e_prefixo_do_voucher(
+    settings: main.Settings,
+) -> None:
+    configuracao_passo_firme = replace(
+        settings,
+        api_display_name="Passo Firme API",
+        voucher_prefix="PFR",
+    )
+    database = FakeDatabase(
+        [
+            {
+                "resultado": "sucesso",
+                "mensagem": "Prêmio confirmado!",
+                "premio": "Brinde",
+                "indice_roleta": 1,
+                "participante_id": 7,
+            }
+        ]
+    )
+    client = client_for(configuracao_passo_firme, database)
+
+    response = client.post(
+        "/sortear/abcdefgh",
+        json={
+            "nome": "Ana Silva",
+            "whatsapp": "11999999999",
+            "ciencia_privacidade": True,
+            "data_nascimento": None,
+            "consentimento_aniversario": False,
+        },
+    )
+
+    assert client.app.title == "Passo Firme API"
+    assert response.status_code == 200
+    assert response.json()["codigo_voucher"] == "PFR-000007"
+
+
 @pytest.mark.parametrize(
     ("codigo", "status_code", "detail"),
     [
@@ -473,6 +510,25 @@ def test_configuracao_exige_todas_as_variaveis(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(RuntimeError, match="SUPABASE_KEY"):
         main.Settings.from_env()
+
+
+def test_configuracao_valida_prefixo_do_voucher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VOUCHER_PREFIX", "prefixo-invalido")
+
+    with pytest.raises(RuntimeError, match="VOUCHER_PREFIX"):
+        main.Settings.from_env()
+
+
+def test_configuracao_le_identidade_da_loja(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_DISPLAY_NAME", "Passo Firme API")
+    monkeypatch.setenv("VOUCHER_PREFIX", "pfr")
+
+    settings = main.Settings.from_env()
+
+    assert settings.api_display_name == "Passo Firme API"
+    assert settings.voucher_prefix == "PFR"
 
 
 def cabecalho_admin(settings: main.Settings) -> dict[str, str]:
