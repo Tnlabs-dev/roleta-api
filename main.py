@@ -26,10 +26,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from supabase import Client, create_client
 
 
-logger = logging.getLogger("cappri_api")
+logger = logging.getLogger("roleta_api")
 
 ORIGEM_OFICIAL = "https://tnlabs-dev.github.io/"
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
+VOUCHER_PREFIX_PATTERN = re.compile(r"^[A-Z0-9]{2,8}$")
 MENSAGEM_BANCO_INDISPONIVEL = (
     "O serviço está temporariamente indisponível. Tente novamente em instantes."
 )
@@ -47,6 +48,8 @@ class Settings:
     admin_session_secret: str
     origens_permitidas: tuple[str, ...] = (ORIGEM_OFICIAL,)
     admin_session_seconds: int = 8 * 60 * 60
+    api_display_name: str = "Roleta API"
+    voucher_prefix: str = "CPR"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -72,6 +75,16 @@ class Settings:
         if not origens:
             raise RuntimeError("Configure ao menos uma origem em ORIGENS_PERMITIDAS.")
 
+        api_display_name = os.environ.get("API_DISPLAY_NAME", "Roleta API").strip()
+        if not api_display_name or len(api_display_name) > 80:
+            raise RuntimeError("API_DISPLAY_NAME precisa ter entre 1 e 80 caracteres.")
+
+        voucher_prefix = os.environ.get("VOUCHER_PREFIX", "CPR").strip().upper()
+        if not VOUCHER_PREFIX_PATTERN.fullmatch(voucher_prefix):
+            raise RuntimeError(
+                "VOUCHER_PREFIX deve conter de 2 a 8 letras maiúsculas ou números."
+            )
+
         return cls(
             supabase_url=valores["SUPABASE_URL"],
             supabase_key=valores["SUPABASE_KEY"],
@@ -79,6 +92,8 @@ class Settings:
             senha_admin=valores["SENHA_ADMIN"],
             admin_session_secret=valores["ADMIN_SESSION_SECRET"],
             origens_permitidas=origens,
+            api_display_name=api_display_name,
+            voucher_prefix=voucher_prefix,
         )
 
 
@@ -335,7 +350,7 @@ def create_app(
     settings = settings or Settings.from_env()
     database = database or create_client(settings.supabase_url, settings.supabase_key)
 
-    api = FastAPI(title="Cappri API", version="5.0.0")
+    api = FastAPI(title=settings.api_display_name, version="5.1.0")
     api.state.settings = settings
     api.state.database = database
     api.state.rate_limiter = InMemoryRateLimiter()
@@ -553,7 +568,7 @@ def create_app(
             "mensagem": resultado["mensagem"],
             "premio": resultado["premio"],
             "indice_roleta": resultado["indice_roleta"],
-            "codigo_voucher": f"CPR-{participante_id:06d}",
+            "codigo_voucher": f"{settings.voucher_prefix}-{participante_id:06d}",
         }
 
     @api.post("/admin/login")
