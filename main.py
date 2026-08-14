@@ -12,7 +12,7 @@ import secrets
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
 from time import monotonic
@@ -29,7 +29,8 @@ from supabase import Client, create_client
 logger = logging.getLogger("roleta_api")
 
 ORIGEM_OFICIAL = "https://tnlabs-dev.github.io/"
-TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
+CODIGO_CURTO_PATTERN = re.compile(r"^[0-9]{6}$")
+TOKEN_LEGADO_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
 VOUCHER_PREFIX_PATTERN = re.compile(r"^[A-Z0-9]{2,8}$")
 MENSAGEM_BANCO_INDISPONIVEL = (
     "O serviço está temporariamente indisponível. Tente novamente em instantes."
@@ -50,6 +51,7 @@ class Settings:
     admin_session_seconds: int = 8 * 60 * 60
     api_display_name: str = "Roleta API"
     voucher_prefix: str = "CPR"
+    codigo_validade_minutos: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -85,6 +87,18 @@ class Settings:
                 "VOUCHER_PREFIX deve conter de 2 a 8 letras maiúsculas ou números."
             )
 
+        validade_texto = os.environ.get("CODIGO_VALIDADE_MINUTOS", "30").strip()
+        try:
+            codigo_validade_minutos = int(validade_texto)
+        except ValueError as erro:
+            raise RuntimeError(
+                "CODIGO_VALIDADE_MINUTOS deve ser um número inteiro."
+            ) from erro
+        if not 5 <= codigo_validade_minutos <= 120:
+            raise RuntimeError(
+                "CODIGO_VALIDADE_MINUTOS deve ficar entre 5 e 120 minutos."
+            )
+
         return cls(
             supabase_url=valores["SUPABASE_URL"],
             supabase_key=valores["SUPABASE_KEY"],
@@ -94,6 +108,7 @@ class Settings:
             origens_permitidas=origens,
             api_display_name=api_display_name,
             voucher_prefix=voucher_prefix,
+            codigo_validade_minutos=codigo_validade_minutos,
         )
 
 
@@ -250,9 +265,11 @@ class InMemoryRateLimiter:
             tentativas.append(agora)
 
 
-def validar_formato_token(token: str) -> None:
-    if not TOKEN_PATTERN.fullmatch(token):
-        raise HTTPException(status_code=404, detail="Token não existe!")
+def validar_formato_codigo(codigo: str, aceitar_legado: bool = True) -> None:
+    codigo_valido = CODIGO_CURTO_PATTERN.fullmatch(codigo)
+    token_legado_valido = aceitar_legado and TOKEN_LEGADO_PATTERN.fullmatch(codigo)
+    if not codigo_valido and not token_legado_valido:
+        raise HTTPException(status_code=404, detail="Código não existe!")
 
 
 def executar_consulta(operacao):
@@ -350,7 +367,7 @@ def create_app(
     settings = settings or Settings.from_env()
     database = database or create_client(settings.supabase_url, settings.supabase_key)
 
-    api = FastAPI(title=settings.api_display_name, version="5.1.0")
+    api = FastAPI(title=settings.api_display_name, version="6.0.0")
     api.state.settings = settings
     api.state.database = database
     api.state.rate_limiter = InMemoryRateLimiter()
@@ -388,27 +405,62 @@ def create_app(
         ):
             raise HTTPException(status_code=401, detail=MENSAGEM_SESSAO_INVALIDA)
 
-    def gerar_token_convite() -> dict[str, str]:
-        novo_token = secrets.token_urlsafe(12)
-        resposta = executar_consulta(
-            lambda: database.rpc(
-                "gerar_convite_roleta", {"p_token": novo_token}
-            ).execute()
+    def gerar_codigo_convite() -> dict[str, Any]:
+        expira_em = datetime.now(timezone.utc) + timedelta(
+            minutes=settings.codigo_validade_minutos
         )
-        resultado = primeira_linha(resposta)
-        if resultado is None:
-            logger.error("RPC gerar_convite_roleta não devolveu resultado")
-            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
-        if resultado.get("resultado") == "sem_campanha":
-            raise HTTPException(status_code=409, detail="Não existe uma campanha ativa.")
-        if resultado.get("resultado") != "sucesso":
-            logger.error("RPC gerar_convite_roleta devolveu estado desconhecido")
-            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
 
-        return {
-            "token": resultado["token_gerado"],
-            "campanha": resultado["campanha"],
-        }
+        for _ in range(12):
+            token_interno = secrets.token_urlsafe(24)
+            codigo_curto = f"{secrets.randbelow(1_000_000):06d}"
+            resposta = executar_consulta(
+                lambda: database.rpc(
+                    "gerar_convite_roleta",
+                    {
+                        "p_token": token_interno,
+                        "p_codigo_curto": codigo_curto,
+                        "p_expira_em": expira_em.isoformat(),
+                    },
+                ).execute()
+            )
+            resultado = primeira_linha(resposta)
+            if resultado is None:
+                logger.error("RPC gerar_convite_roleta não devolveu resultado")
+                raise HTTPException(
+                    status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL
+                )
+            if resultado.get("resultado") == "codigo_em_uso":
+                continue
+            if resultado.get("resultado") == "sem_campanha":
+                raise HTTPException(
+                    status_code=409, detail="Não existe uma campanha ativa."
+                )
+            if resultado.get("resultado") != "sucesso":
+                logger.error("RPC gerar_convite_roleta devolveu estado desconhecido")
+                raise HTTPException(
+                    status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL
+                )
+
+            codigo_gerado = resultado.get("codigo_gerado")
+            if not isinstance(codigo_gerado, str) or not CODIGO_CURTO_PATTERN.fullmatch(
+                codigo_gerado
+            ):
+                logger.error("RPC gerar_convite_roleta devolveu código inválido")
+                raise HTTPException(
+                    status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL
+                )
+
+            expiracao_retornada = resultado.get("expira_em") or expira_em.isoformat()
+            return {
+                "codigo": codigo_gerado,
+                "token": codigo_gerado,
+                "campanha": resultado["campanha"],
+                "expira_em": expiracao_retornada,
+                "validade_minutos": settings.codigo_validade_minutos,
+            }
+
+        logger.error("Não foi possível reservar um código curto após várias tentativas")
+        raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
 
     def executar_rpc_admin(
         nome: str,
@@ -436,14 +488,14 @@ def create_app(
         return {"status": "acordado"}
 
     @api.post("/gerar-convite")
-    def gerar_convite(dados: GerarConviteInput, request: Request) -> dict[str, str]:
+    def gerar_convite(dados: GerarConviteInput, request: Request) -> dict[str, Any]:
         api.state.rate_limiter.verificar(request, "gerar-convite", limite=5)
 
         senha_enviada = dados.senha.encode("utf-8")
         senha_correta = settings.senha_funcionaria.encode("utf-8")
         if not secrets.compare_digest(senha_enviada, senha_correta):
             raise HTTPException(status_code=401, detail="Senha incorreta.")
-        return gerar_token_convite()
+        return gerar_codigo_convite()
 
     @api.get("/premios")
     def listar_premios() -> dict[str, Any]:
@@ -486,14 +538,13 @@ def create_app(
             "dados": premios,
         }
 
-    @api.get("/verificar-token/{token}")
-    def verificar_token(token: str, request: Request) -> dict[str, Any]:
-        validar_formato_token(token)
-        api.state.rate_limiter.verificar(request, "verificar-token", limite=20)
+    def consultar_codigo(codigo: str, request: Request) -> dict[str, Any]:
+        validar_formato_codigo(codigo)
+        api.state.rate_limiter.verificar(request, "verificar-codigo", limite=10)
 
         resposta = executar_consulta(
             lambda: database.rpc(
-                "verificar_token_roleta", {"p_token": token}
+                "verificar_token_roleta", {"p_token": codigo}
             ).execute()
         )
         resultado = primeira_linha(resposta)
@@ -506,13 +557,24 @@ def create_app(
             retorno["mensagem"] = resultado["mensagem"]
         if resultado.get("campanha"):
             retorno["campanha"] = resultado["campanha"]
+        if resultado.get("expira_em"):
+            retorno["expira_em"] = resultado["expira_em"]
         return retorno
+
+    @api.get("/verificar-codigo/{codigo}")
+    def verificar_codigo(codigo: str, request: Request) -> dict[str, Any]:
+        validar_formato_codigo(codigo, aceitar_legado=False)
+        return consultar_codigo(codigo, request)
+
+    @api.get("/verificar-token/{token}")
+    def verificar_token_legado(token: str, request: Request) -> dict[str, Any]:
+        return consultar_codigo(token, request)
 
     @api.post("/sortear/{token}")
     def sortear_premio(
         token: str, dados: ParticipanteInput, request: Request
     ) -> dict[str, Any]:
-        validar_formato_token(token)
+        validar_formato_codigo(token)
         api.state.rate_limiter.verificar(request, "sortear", limite=5)
 
         resposta = executar_consulta(
@@ -541,9 +603,13 @@ def create_app(
 
         codigo = resultado.get("resultado")
         erros_conhecidos = {
-            "token_invalido": (404, "Token não existe!"),
-            "token_utilizado": (409, "Esse link já foi utilizado!"),
-            "token_cancelado": (409, "Este convite foi cancelado."),
+            "token_invalido": (404, "Código não existe!"),
+            "token_utilizado": (409, "Este código já foi utilizado!"),
+            "token_cancelado": (409, "Este código foi cancelado."),
+            "codigo_expirado": (
+                409,
+                "Este código expirou. Peça um novo código no caixa.",
+            ),
             "campanha_inativa": (409, "Esta campanha não está ativa."),
             "sem_premios": (409, "Acabaram os prêmios no estoque!"),
         }
@@ -608,13 +674,40 @@ def create_app(
         painel = resultado["painel"]
         if painel.get("resultado") == "campanha_nao_encontrada":
             raise HTTPException(status_code=404, detail="Campanha não encontrada.")
+
+        campanha = painel.get("campanha")
+        campanha_selecionada = campanha.get("id") if isinstance(campanha, dict) else None
+        if isinstance(campanha_selecionada, int):
+            resposta_convites = executar_consulta(
+                lambda: database.rpc(
+                    "obter_convites_admin",
+                    {"p_campanha_id": campanha_selecionada},
+                ).execute()
+            )
+            linha_convites = primeira_linha(resposta_convites)
+            resumo_convites = (
+                linha_convites.get("resumo")
+                if isinstance(linha_convites, dict)
+                else None
+            )
+            if not isinstance(resumo_convites, dict):
+                logger.error("RPC obter_convites_admin não devolveu resultado válido")
+                raise HTTPException(
+                    status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL
+                )
+            painel["convites"] = resumo_convites.get("convites", [])
+            metricas = painel.setdefault("metricas", {})
+            if isinstance(metricas, dict) and isinstance(
+                resumo_convites.get("metricas"), dict
+            ):
+                metricas.update(resumo_convites["metricas"])
         return painel
 
     @api.post("/admin/convites")
-    def gerar_convite_admin(request: Request) -> dict[str, str]:
+    def gerar_convite_admin(request: Request) -> dict[str, Any]:
         exigir_admin(request)
         api.state.rate_limiter.verificar(request, "admin-convites", limite=20)
-        return gerar_token_convite()
+        return gerar_codigo_convite()
 
     @api.patch("/admin/convites/{convite_id}/cancelar")
     def cancelar_convite_admin(convite_id: int, request: Request) -> dict[str, Any]:

@@ -133,13 +133,18 @@ def test_gerar_convite_rejeita_senha_incorreta_sem_consultar_banco(
     assert database.calls == []
 
 
-def test_gerar_convite_salva_token_seguro(settings: main.Settings) -> None:
+def test_gerar_convite_cria_codigo_curto_e_token_interno(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.secrets, "randbelow", lambda limite: 482_731)
+    monkeypatch.setattr(main.secrets, "token_urlsafe", lambda tamanho: "A" * 32)
     database = FakeDatabase(
         [
             {
                 "resultado": "sucesso",
-                "token_gerado": "token-devolvido",
+                "codigo_gerado": "482731",
                 "campanha": "Campanha de testes",
+                "expira_em": "2026-08-14T16:30:00+00:00",
             }
         ]
     )
@@ -149,13 +154,48 @@ def test_gerar_convite_salva_token_seguro(settings: main.Settings) -> None:
 
     assert response.status_code == 200
     assert response.json() == {
-        "token": "token-devolvido",
+        "codigo": "482731",
+        "token": "482731",
         "campanha": "Campanha de testes",
+        "expira_em": "2026-08-14T16:30:00+00:00",
+        "validade_minutos": 30,
     }
     assert database.calls[0]["source"] == "rpc:gerar_convite_roleta"
-    token_enviado = database.calls[0]["params"]["p_token"]
-    assert main.TOKEN_PATTERN.fullmatch(token_enviado)
-    assert len(token_enviado) == 16
+    params = database.calls[0]["params"]
+    assert params["p_codigo_curto"] == "482731"
+    assert main.TOKEN_LEGADO_PATTERN.fullmatch(params["p_token"])
+    assert len(params["p_token"]) == 32
+    assert params["p_expira_em"].endswith("+00:00")
+
+
+def test_gerar_convite_tenta_outro_codigo_quando_ha_colisao(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codigos = iter([123_456, 654_321])
+    monkeypatch.setattr(main.secrets, "randbelow", lambda limite: next(codigos))
+    monkeypatch.setattr(main.secrets, "token_urlsafe", lambda tamanho: "B" * 32)
+    database = FakeDatabase(
+        [{"resultado": "codigo_em_uso"}],
+        [
+            {
+                "resultado": "sucesso",
+                "codigo_gerado": "654321",
+                "campanha": "Campanha de testes",
+                "expira_em": "2026-08-14T16:30:00+00:00",
+            }
+        ],
+    )
+
+    response = client_for(settings, database).post(
+        "/gerar-convite", json={"senha": "test-password"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["codigo"] == "654321"
+    assert [call["params"]["p_codigo_curto"] for call in database.calls] == [
+        "123456",
+        "654321",
+    ]
 
 
 def test_gerar_convite_exige_campanha_ativa(settings: main.Settings) -> None:
@@ -184,12 +224,12 @@ def test_limite_de_senha_e_separado_por_rota(settings: main.Settings) -> None:
     assert verificar.json() == {"valido": True, "campanha": "Teste"}
 
 
-def test_verificar_token_invalido_nao_consulta_banco(settings: main.Settings) -> None:
+def test_verificar_codigo_invalido_nao_consulta_banco(settings: main.Settings) -> None:
     database = FakeDatabase()
-    response = client_for(settings, database).get("/verificar-token/curto")
+    response = client_for(settings, database).get("/verificar-codigo/12ab")
 
     assert response.status_code == 404
-    assert response.json() == {"detail": "Token não existe!"}
+    assert response.json() == {"detail": "Código não existe!"}
     assert database.calls == []
 
 
@@ -197,20 +237,20 @@ def test_verificar_token_invalido_nao_consulta_banco(settings: main.Settings) ->
     ("database_result", "expected"),
     [
         (
-            [{"valido": False, "mensagem": "Token não existe!", "campanha": None}],
-            {"valido": False, "mensagem": "Token não existe!"},
+            [{"valido": False, "mensagem": "Código não existe!", "campanha": None}],
+            {"valido": False, "mensagem": "Código não existe!"},
         ),
         (
             [
                 {
                     "valido": False,
-                    "mensagem": "Esse link já foi utilizado!",
+                    "mensagem": "Este código já foi utilizado!",
                     "campanha": "Teste",
                 }
             ],
             {
                 "valido": False,
-                "mensagem": "Esse link já foi utilizado!",
+                "mensagem": "Este código já foi utilizado!",
                 "campanha": "Teste",
             },
         ),
@@ -220,13 +260,13 @@ def test_verificar_token_invalido_nao_consulta_banco(settings: main.Settings) ->
         ),
     ],
 )
-def test_verificar_token(
+def test_verificar_codigo(
     settings: main.Settings,
     database_result: list[dict[str, Any]],
     expected: dict[str, Any],
 ) -> None:
     database = FakeDatabase(database_result)
-    response = client_for(settings, database).get("/verificar-token/abcdefgh")
+    response = client_for(settings, database).get("/verificar-codigo/482731")
 
     assert response.status_code == 200
     assert response.json() == expected
@@ -234,8 +274,19 @@ def test_verificar_token(
         "source": "rpc:verificar_token_roleta",
         "filters": [],
         "action": "rpc",
-        "params": {"p_token": "abcdefgh"},
+        "params": {"p_token": "482731"},
     }
+
+
+def test_verificar_token_legado_continua_compativel(settings: main.Settings) -> None:
+    database = FakeDatabase(
+        [{"valido": True, "mensagem": None, "campanha": "Teste"}]
+    )
+
+    response = client_for(settings, database).get("/verificar-token/abcdefgh")
+
+    assert response.status_code == 200
+    assert response.json() == {"valido": True, "campanha": "Teste"}
 
 
 def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) -> None:
@@ -367,9 +418,14 @@ def test_personaliza_nome_da_api_e_prefixo_do_voucher(
 @pytest.mark.parametrize(
     ("codigo", "status_code", "detail"),
     [
-        ("token_invalido", 404, "Token não existe!"),
-        ("token_utilizado", 409, "Esse link já foi utilizado!"),
-        ("token_cancelado", 409, "Este convite foi cancelado."),
+        ("token_invalido", 404, "Código não existe!"),
+        ("token_utilizado", 409, "Este código já foi utilizado!"),
+        ("token_cancelado", 409, "Este código foi cancelado."),
+        (
+            "codigo_expirado",
+            409,
+            "Este código expirou. Peça um novo código no caixa.",
+        ),
         ("campanha_inativa", 409, "Esta campanha não está ativa."),
         ("sem_premios", 409, "Acabaram os prêmios no estoque!"),
     ],
@@ -524,11 +580,23 @@ def test_configuracao_valida_prefixo_do_voucher(
 def test_configuracao_le_identidade_da_loja(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("API_DISPLAY_NAME", "Passo Firme API")
     monkeypatch.setenv("VOUCHER_PREFIX", "pfr")
+    monkeypatch.setenv("CODIGO_VALIDADE_MINUTOS", "60")
 
     settings = main.Settings.from_env()
 
     assert settings.api_display_name == "Passo Firme API"
     assert settings.voucher_prefix == "PFR"
+    assert settings.codigo_validade_minutos == 60
+
+
+@pytest.mark.parametrize("valor", ["quarenta", "4", "121"])
+def test_configuracao_rejeita_validade_invalida(
+    monkeypatch: pytest.MonkeyPatch, valor: str
+) -> None:
+    monkeypatch.setenv("CODIGO_VALIDADE_MINUTOS", valor)
+
+    with pytest.raises(RuntimeError, match="CODIGO_VALIDADE_MINUTOS"):
+        main.Settings.from_env()
 
 
 def cabecalho_admin(settings: main.Settings) -> dict[str, str]:
@@ -613,15 +681,40 @@ def test_painel_admin_retorna_agregados_protegidos(
         "convites": [],
         "auditoria": [],
     }
-    database = FakeDatabase([{"painel": painel}])
+    resumo_convites = {
+        "metricas": {"convites_pendentes": 1, "convites_expirados": 2},
+        "convites": [
+            {
+                "id": 9,
+                "codigo": "482731",
+                "token": "482731",
+                "status": "pendente",
+            }
+        ],
+    }
+    database = FakeDatabase(
+        [{"painel": painel}],
+        [{"resumo": resumo_convites}],
+    )
     response = client_for(settings, database).get(
         "/admin/painel?campanha_id=1", headers=cabecalho_admin(settings)
     )
 
     assert response.status_code == 200
-    assert response.json() == painel
+    assert response.json()["convites"] == resumo_convites["convites"]
+    assert response.json()["metricas"] == {
+        "participantes": 3,
+        "convites_pendentes": 1,
+        "convites_expirados": 2,
+    }
     assert database.calls[0] == {
         "source": "rpc:obter_painel_admin",
+        "filters": [],
+        "action": "rpc",
+        "params": {"p_campanha_id": 1},
+    }
+    assert database.calls[1] == {
+        "source": "rpc:obter_convites_admin",
         "filters": [],
         "action": "rpc",
         "params": {"p_campanha_id": 1},
