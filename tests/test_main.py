@@ -110,6 +110,17 @@ def test_cors_aceita_apenas_origem_oficial(settings: main.Settings) -> None:
     assert "authorization" in response.headers["access-control-allow-headers"].lower()
     assert "access-control-allow-credentials" not in response.headers
 
+    delete_preflight = client.options(
+        "/admin/participantes?campanha_id=1",
+        headers={
+            "Origin": main.ORIGEM_OFICIAL,
+            "Access-Control-Request-Method": "DELETE",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert delete_preflight.status_code == 200
+    assert "DELETE" in delete_preflight.headers["access-control-allow-methods"]
+
     blocked = client.options(
         "/sortear/abcdefgh",
         headers={
@@ -803,3 +814,84 @@ def test_exportacao_csv_protege_formula_e_usa_utf8(
     assert "1990-05-20" in response.content.decode("utf-8-sig")
     assert "Versão da política" in response.content.decode("utf-8-sig")
     assert "attachment" in response.headers["content-disposition"]
+    assert response.headers["x-total-registros"] == "1"
+
+
+def test_limpeza_de_participantes_exige_sessao_sem_consultar_banco(
+    settings: main.Settings,
+) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).request(
+        "DELETE",
+        "/admin/participantes?campanha_id=1",
+        json={"confirmacao": "EXCLUIR", "total_esperado": 3},
+    )
+
+    assert response.status_code == 401
+    assert database.calls == []
+
+
+def test_limpeza_rejeita_confirmacao_incorreta_sem_consultar_banco(
+    settings: main.Settings,
+) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).request(
+        "DELETE",
+        "/admin/participantes?campanha_id=1",
+        headers=cabecalho_admin(settings),
+        json={"confirmacao": "excluir", "total_esperado": 3},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Digite EXCLUIR exatamente como solicitado."
+    }
+    assert database.calls == []
+
+
+def test_limpeza_exclui_somente_quando_total_confere(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase(
+        [{"resultado": "sucesso", "quantidade_excluida": 3}]
+    )
+    response = client_for(settings, database).request(
+        "DELETE",
+        "/admin/participantes?campanha_id=7",
+        headers=cabecalho_admin(settings),
+        json={"confirmacao": "EXCLUIR", "total_esperado": 3},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "resultado": "sucesso",
+        "quantidade_excluida": 3,
+        "mensagem": "3 participante(s) excluída(s).",
+    }
+    assert database.calls[0] == {
+        "source": "rpc:limpar_participantes_admin",
+        "filters": [],
+        "action": "rpc",
+        "params": {"p_campanha_id": 7, "p_total_esperado": 3},
+    }
+
+
+def test_limpeza_interrompe_se_lista_mudou_depois_do_backup(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase(
+        [{"resultado": "dados_alterados", "quantidade_excluida": 4}]
+    )
+    response = client_for(settings, database).request(
+        "DELETE",
+        "/admin/participantes?campanha_id=7",
+        headers=cabecalho_admin(settings),
+        json={"confirmacao": "EXCLUIR", "total_esperado": 3},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "A lista mudou depois do backup. Baixe uma nova planilha e tente novamente."
+    }
