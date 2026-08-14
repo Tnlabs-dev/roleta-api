@@ -177,6 +177,18 @@ class AdminLoginInput(BaseModel):
     senha: str = Field(min_length=1, max_length=256)
 
 
+class LimparParticipantesInput(BaseModel):
+    confirmacao: str = Field(min_length=7, max_length=7)
+    total_esperado: int = Field(ge=0, le=10_000_000)
+
+    @field_validator("confirmacao")
+    @classmethod
+    def validar_confirmacao(cls, valor: str) -> str:
+        if valor != "EXCLUIR":
+            raise ValueError("Digite EXCLUIR exatamente como solicitado.")
+        return valor
+
+
 class CampanhaBaseInput(BaseModel):
     nome: str = Field(min_length=3, max_length=100)
     data_inicio: datetime | None = None
@@ -367,7 +379,7 @@ def create_app(
     settings = settings or Settings.from_env()
     database = database or create_client(settings.supabase_url, settings.supabase_key)
 
-    api = FastAPI(title=settings.api_display_name, version="6.0.0")
+    api = FastAPI(title=settings.api_display_name, version="6.1.0")
     api.state.settings = settings
     api.state.database = database
     api.state.rate_limiter = InMemoryRateLimiter()
@@ -376,8 +388,9 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(settings.origens_permitidas),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "PATCH"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Content-Type", "Authorization"],
+        expose_headers=["Content-Disposition", "X-Total-Registros"],
     )
 
     @api.middleware("http")
@@ -836,6 +849,37 @@ def create_app(
             },
         )
 
+    @api.delete("/admin/participantes")
+    def limpar_participantes_admin(
+        dados: LimparParticipantesInput, request: Request, campanha_id: int
+    ) -> dict[str, Any]:
+        exigir_admin(request)
+        api.state.rate_limiter.verificar(request, "admin-limpeza", limite=3)
+        resultado = executar_rpc_admin(
+            "limpar_participantes_admin",
+            {
+                "p_campanha_id": campanha_id,
+                "p_total_esperado": dados.total_esperado,
+            },
+            {
+                "campanha_nao_encontrada": "Campanha não encontrada.",
+                "dados_alterados": (
+                    "A lista mudou depois do backup. Baixe uma nova planilha e tente novamente."
+                ),
+            },
+        )
+        quantidade = resultado.get("quantidade_excluida")
+        if not isinstance(quantidade, int) or quantidade < 0:
+            logger.error(
+                "RPC limpar_participantes_admin devolveu quantidade inválida"
+            )
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
+        return {
+            "resultado": "sucesso",
+            "quantidade_excluida": quantidade,
+            "mensagem": f"{quantidade} participante(s) excluída(s).",
+        }
+
     @api.get("/admin/participantes.csv")
     def exportar_participantes_csv(
         request: Request, campanha_id: int
@@ -900,7 +944,8 @@ def create_app(
             headers={
                 "Content-Disposition": (
                     f'attachment; filename="participantes-campanha-{campanha_id}.csv"'
-                )
+                ),
+                "X-Total-Registros": str(len(linhas)),
             },
         )
 
