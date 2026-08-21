@@ -194,11 +194,26 @@ class CampanhaBaseInput(BaseModel):
     data_inicio: datetime | None = None
     data_fim: datetime | None = None
     texto_consentimento: str = Field(min_length=10, max_length=500)
+    mensagem_whatsapp: str | None = Field(
+        default=None, min_length=10, max_length=1000
+    )
 
     @field_validator("nome", "texto_consentimento")
     @classmethod
     def normalizar_texto(cls, valor: str) -> str:
         return " ".join(valor.split())
+
+    @field_validator("mensagem_whatsapp")
+    @classmethod
+    def normalizar_mensagem_whatsapp(cls, valor: str | None) -> str | None:
+        if valor is None:
+            return None
+        normalizada = valor.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not 10 <= len(normalizada) <= 1000:
+            raise ValueError(
+                "A mensagem do WhatsApp deve ter entre 10 e 1000 caracteres."
+            )
+        return normalizada
 
     @model_validator(mode="after")
     def validar_periodo(self) -> "CampanhaBaseInput":
@@ -379,7 +394,7 @@ def create_app(
     settings = settings or Settings.from_env()
     database = database or create_client(settings.supabase_url, settings.supabase_key)
 
-    api = FastAPI(title=settings.api_display_name, version="6.1.0")
+    api = FastAPI(title=settings.api_display_name, version="6.2.0")
     api.state.settings = settings
     api.state.database = database
     api.state.rate_limiter = InMemoryRateLimiter()
@@ -538,12 +553,26 @@ def create_app(
             for linha in linhas
             if linha.get("premio_id") is not None
         ]
+        resposta_configuracao = executar_consulta(
+            lambda: database.table("campanhas")
+            .select("mensagem_whatsapp")
+            .eq("id", primeiro["campanha_id"])
+            .limit(1)
+            .execute()
+        )
+        configuracao = primeira_linha(resposta_configuracao)
+        if configuracao is None:
+            logger.error(
+                "Campanha da roleta não foi encontrada ao buscar a mensagem"
+            )
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
         return {
             "status": "sucesso",
             "campanha": {
                 "id": primeiro["campanha_id"],
                 "nome": primeiro["campanha_nome"],
                 "texto_consentimento": primeiro.get("texto_consentimento"),
+                "mensagem_whatsapp": configuracao.get("mensagem_whatsapp"),
                 "politica_privacidade_versao": primeiro.get(
                     "politica_privacidade_versao"
                 ),
@@ -689,8 +718,25 @@ def create_app(
             raise HTTPException(status_code=404, detail="Campanha não encontrada.")
 
         campanha = painel.get("campanha")
-        campanha_selecionada = campanha.get("id") if isinstance(campanha, dict) else None
+        campanha_selecionada = (
+            campanha.get("id") if isinstance(campanha, dict) else None
+        )
         if isinstance(campanha_selecionada, int):
+            resposta_configuracao = executar_consulta(
+                lambda: database.table("campanhas")
+                .select("mensagem_whatsapp")
+                .eq("id", campanha_selecionada)
+                .limit(1)
+                .execute()
+            )
+            configuracao = primeira_linha(resposta_configuracao)
+            if configuracao is None:
+                logger.error("Campanha não foi encontrada ao buscar a mensagem")
+                raise HTTPException(
+                    status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL
+                )
+            campanha["mensagem_whatsapp"] = configuracao.get("mensagem_whatsapp")
+
             resposta_convites = executar_consulta(
                 lambda: database.rpc(
                     "obter_convites_admin",
@@ -749,6 +795,7 @@ def create_app(
                 else None,
                 "p_data_fim": dados.data_fim.isoformat() if dados.data_fim else None,
                 "p_texto_consentimento": dados.texto_consentimento,
+                "p_mensagem_whatsapp": dados.mensagem_whatsapp,
             },
         )
 
@@ -768,6 +815,7 @@ def create_app(
                 else None,
                 "p_data_fim": dados.data_fim.isoformat() if dados.data_fim else None,
                 "p_texto_consentimento": dados.texto_consentimento,
+                "p_mensagem_whatsapp": dados.mensagem_whatsapp,
             },
             {
                 "nao_encontrada": "Campanha não encontrada.",

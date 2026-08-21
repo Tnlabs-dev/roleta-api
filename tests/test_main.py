@@ -314,7 +314,14 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
                 "premio_nome": "Brinde",
                 "posicao_roleta": 2,
             }
-        ]
+        ],
+        [
+            {
+                "mensagem_whatsapp": (
+                    "Olá, {nome}! Conheça a campanha {campanha} da {loja}."
+                )
+            }
+        ],
     )
     response = client_for(settings, database).get("/premios")
 
@@ -325,6 +332,9 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
             "id": 1,
             "nome": "Campanha de testes",
             "texto_consentimento": "Li o Aviso de Privacidade da campanha.",
+            "mensagem_whatsapp": (
+                "Olá, {nome}! Conheça a campanha {campanha} da {loja}."
+            ),
             "politica_privacidade_versao": "1.0",
         },
         "dados": [{"id": 7, "nome": "Brinde", "posicao_roleta": 2}],
@@ -332,6 +342,13 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
     assert "estoque_disponivel" not in response.text
     assert "peso_sorteio" not in response.text
     assert database.calls[0]["source"] == "rpc:listar_premios_roleta"
+    assert database.calls[1] == {
+        "source": "table:campanhas",
+        "filters": [("eq", "id", 1)],
+        "action": "select",
+        "columns": "mensagem_whatsapp",
+        "limit": 1,
+    }
 
 
 def test_premios_exige_campanha_ativa(settings: main.Settings) -> None:
@@ -705,6 +722,7 @@ def test_painel_admin_retorna_agregados_protegidos(
     }
     database = FakeDatabase(
         [{"painel": painel}],
+        [{"mensagem_whatsapp": "Compartilhe a campanha {campanha}."}],
         [{"resumo": resumo_convites}],
     )
     response = client_for(settings, database).get(
@@ -712,6 +730,9 @@ def test_painel_admin_retorna_agregados_protegidos(
     )
 
     assert response.status_code == 200
+    assert response.json()["campanha"]["mensagem_whatsapp"] == (
+        "Compartilhe a campanha {campanha}."
+    )
     assert response.json()["convites"] == resumo_convites["convites"]
     assert response.json()["metricas"] == {
         "participantes": 3,
@@ -725,11 +746,68 @@ def test_painel_admin_retorna_agregados_protegidos(
         "params": {"p_campanha_id": 1},
     }
     assert database.calls[1] == {
+        "source": "table:campanhas",
+        "filters": [("eq", "id", 1)],
+        "action": "select",
+        "columns": "mensagem_whatsapp",
+        "limit": 1,
+    }
+    assert database.calls[2] == {
         "source": "rpc:obter_convites_admin",
         "filters": [],
         "action": "rpc",
         "params": {"p_campanha_id": 1},
     }
+
+
+def test_admin_atualiza_mensagem_whatsapp_da_campanha(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase([{"resultado": "sucesso", "campanha_id": 7}])
+    response = client_for(settings, database).put(
+        "/admin/campanhas/7",
+        headers=cabecalho_admin(settings),
+        json={
+            "nome": "Campanha de testes",
+            "data_inicio": "2026-08-01T12:00:00-03:00",
+            "data_fim": "2027-08-01T12:00:00-03:00",
+            "texto_consentimento": "Li o Aviso de Privacidade da campanha.",
+            "mensagem_whatsapp": (
+                "  Olá, {nome}!\r\nConheça a campanha {campanha} da {loja}.  "
+            ),
+            "status": "ativa",
+        },
+    )
+
+    assert response.status_code == 200
+    assert database.calls[0]["source"] == "rpc:atualizar_campanha_admin"
+    assert database.calls[0]["params"]["p_mensagem_whatsapp"] == (
+        "Olá, {nome}!\nConheça a campanha {campanha} da {loja}."
+    )
+
+
+@pytest.mark.parametrize("mensagem", ["curta", " " * 12, "x" * 1001])
+def test_admin_rejeita_mensagem_whatsapp_fora_do_limite(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch, mensagem: str
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase()
+    response = client_for(settings, database).put(
+        "/admin/campanhas/7",
+        headers=cabecalho_admin(settings),
+        json={
+            "nome": "Campanha de testes",
+            "data_inicio": None,
+            "data_fim": None,
+            "texto_consentimento": "Li o Aviso de Privacidade da campanha.",
+            "mensagem_whatsapp": mensagem,
+            "status": "rascunho",
+        },
+    )
+
+    assert response.status_code == 422
+    assert database.calls == []
 
 
 def test_admin_atualiza_premio_por_rpc_atomica(
